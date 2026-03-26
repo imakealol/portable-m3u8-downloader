@@ -12,7 +12,6 @@ Electron 기반 M3U8 스트림 다운로더입니다. 내부에 `ffmpeg.exe`를 
 ## 시작하기
 
 ```bash
-cd m3u8-downloader
 npm install
 ```
 
