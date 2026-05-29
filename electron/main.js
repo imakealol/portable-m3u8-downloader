@@ -11,6 +11,7 @@ const { spawn } = require('child_process');
 
 let mainWindow = null;
 let ffmpegChild = null;
+let currentTempPath = null;
 
 function getFfmpegPath() {
   if (app.isPackaged) {
@@ -65,6 +66,36 @@ function killFfmpeg() {
   }
 }
 
+function cleanupTemp() {
+  if (currentTempPath) {
+    try {
+      if (fs.existsSync(currentTempPath)) fs.unlinkSync(currentTempPath);
+    } catch {
+      /* ignore */
+    }
+    currentTempPath = null;
+  }
+}
+
+function runFfmpeg(ffmpeg, args, onStderr) {
+  return new Promise((resolve) => {
+    const child = spawn(ffmpeg, args, {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    ffmpegChild = child;
+    child.stderr.on('data', (chunk) => onStderr(chunk.toString()));
+    child.on('error', (err) => {
+      ffmpegChild = null;
+      resolve({ code: -1, signal: null, error: err.message || String(err) });
+    });
+    child.on('close', (code, signal) => {
+      ffmpegChild = null;
+      resolve({ code, signal, error: null });
+    });
+  });
+}
+
 app.whenReady().then(() => {
   createWindow();
 
@@ -75,10 +106,14 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   killFfmpeg();
+  cleanupTemp();
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => killFfmpeg());
+app.on('before-quit', () => {
+  killFfmpeg();
+  cleanupTemp();
+});
 
 ipcMain.handle('pick-save-folder', async () => {
   const defaultPath = app.getPath('downloads');
@@ -128,65 +163,93 @@ ipcMain.handle('start-download', async (_event, { url, outputDir }) => {
   }
 
   const outputPath = path.join(dir, defaultOutputBasename());
+  const tempPath = `${outputPath}.part.ts`;
   sendProgress({ type: 'saveAs', baseName: path.basename(outputPath) });
 
   killFfmpeg();
-
-  const args = [
-    '-hide_banner',
-    '-loglevel',
-    'info',
-    '-stats',
-    '-y',
-    '-i',
-    trimmed,
-    '-c',
-    'copy',
-    outputPath,
-  ];
-
-  ffmpegChild = spawn(ffmpeg, args, {
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  cleanupTemp();
+  currentTempPath = tempPath;
 
   const timeRe = /time=(\d+):(\d+):(\d+\.\d+)/;
-
-  ffmpegChild.stderr.on('data', (chunk) => {
-    const text = chunk.toString();
+  const handleStderr = (phase) => (text) => {
     const lines = text.split(/\r?\n/).filter(Boolean);
     for (const line of lines) {
       const m = line.match(timeRe);
       if (m) {
-        sendProgress({ type: 'time', time: `${m[1]}:${m[2]}:${m[3]}` });
+        sendProgress({ type: 'time', time: `${m[1]}:${m[2]}:${m[3]}`, phase });
       }
     }
     sendProgress({ type: 'log', line: text.trimEnd() });
-  });
+  };
 
-  return new Promise((resolve) => {
-    ffmpegChild.on('error', (err) => {
-      ffmpegChild = null;
-      resolve({ ok: false, error: err.message || String(err) });
-    });
+  // Phase 1: HLS → MPEG-TS (TS muxer normalizes the discontinuity-induced
+  // PTS jumps that come from concatenated fMP4 sources).
+  const dlArgs = [
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-stats',
+    '-y',
+    '-fflags', '+genpts',
+    '-i', trimmed,
+    '-c', 'copy',
+    '-bsf:v', 'h264_mp4toannexb',
+    '-f', 'mpegts',
+    tempPath,
+  ];
 
-    ffmpegChild.on('close', (code, signal) => {
-      ffmpegChild = null;
-      if (code === 0) {
-        resolve({ ok: true, outputPath });
-      } else if (signal === 'SIGTERM') {
-        resolve({ ok: false, error: '사용자에 의해 중지되었습니다.' });
-      } else {
-        resolve({
-          ok: false,
-          error: `FFmpeg가 비정상 종료했습니다 (코드 ${code}).\n네트워크·URL·DRM 여부를 확인해 주세요.`,
-        });
-      }
-    });
-  });
+  const dl = await runFfmpeg(ffmpeg, dlArgs, handleStderr('download'));
+
+  if (dl.error) {
+    cleanupTemp();
+    return { ok: false, error: dl.error };
+  }
+  if (dl.signal === 'SIGTERM') {
+    cleanupTemp();
+    return { ok: false, error: '사용자에 의해 중지되었습니다.' };
+  }
+  if (dl.code !== 0) {
+    cleanupTemp();
+    return {
+      ok: false,
+      error: `FFmpeg 다운로드가 비정상 종료했습니다 (코드 ${dl.code}).\n네트워크·URL·DRM 여부를 확인해 주세요.`,
+    };
+  }
+
+  // Phase 2: MPEG-TS → MP4 (fast remux, normalized timestamps preserved).
+  sendProgress({ type: 'log', line: '[mux] MP4로 마무리 중…' });
+  const muxArgs = [
+    '-hide_banner',
+    '-loglevel', 'warning',
+    '-stats',
+    '-y',
+    '-i', tempPath,
+    '-c', 'copy',
+    '-movflags', '+faststart',
+    outputPath,
+  ];
+
+  const mux = await runFfmpeg(ffmpeg, muxArgs, handleStderr('mux'));
+
+  cleanupTemp();
+
+  if (mux.error) {
+    return { ok: false, error: mux.error };
+  }
+  if (mux.signal === 'SIGTERM') {
+    return { ok: false, error: '사용자에 의해 중지되었습니다.' };
+  }
+  if (mux.code !== 0) {
+    return {
+      ok: false,
+      error: `FFmpeg MP4 변환이 비정상 종료했습니다 (코드 ${mux.code}).`,
+    };
+  }
+
+  return { ok: true, outputPath };
 });
 
 ipcMain.handle('cancel-download', async () => {
   killFfmpeg();
+  cleanupTemp();
   return { ok: true };
 });
