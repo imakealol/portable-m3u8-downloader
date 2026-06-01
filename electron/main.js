@@ -215,15 +215,28 @@ ipcMain.handle('start-download', async (_event, { url, outputDir }) => {
     };
   }
 
-  // Phase 2: MPEG-TS → MP4 (fast remux, normalized timestamps preserved).
-  sendProgress({ type: 'log', line: '[mux] MP4로 마무리 중…' });
+  // Phase 2: MPEG-TS → MP4 (CFR re-encode).
+  // -c copy 로 리먹스하면 원본 HLS의 PTS 불연속(세그먼트 누락·디스컨티뉴이티)이
+  // 그대로 남는다. PotPlayer 등 관대한 플레이어는 무시하지만, OBS 미디어 소스는
+  // PTS를 실시간 타임라인에 충실히 동기화하므로 갭 구간을 스킵해버린다.
+  // 고정 프레임레이트(CFR)로 재인코딩하면 타임라인이 연속적으로 재구성되어
+  // (갭은 프레임 복제로 채워짐) OBS에서 스킵 없이 재생된다.
+  sendProgress({ type: 'log', line: '[mux] MP4로 마무리 중(CFR 재인코딩)…' });
   const muxArgs = [
     '-hide_banner',
     '-loglevel', 'warning',
     '-stats',
     '-y',
+    '-fflags', '+genpts',
     '-i', tempPath,
-    '-c', 'copy',
+    '-fps_mode', 'cfr',
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-crf', '20',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac',
+    '-b:a', '192k',
+    '-af', 'aresample=async=1:first_pts=0',
     '-movflags', '+faststart',
     outputPath,
   ];
